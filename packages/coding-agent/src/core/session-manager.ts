@@ -22,6 +22,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	createFoldSummaryMessage,
 } from "./messages.js";
 
 export const CURRENT_SESSION_VERSION = 3;
@@ -113,6 +114,24 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
+/** Fold entry - marks a range of entries as folded (compressed). */
+export interface FoldEntry extends SessionEntryBase {
+	type: "fold";
+	/** Entry id of first entry in folded range (closest to root) */
+	rangeStartId: string;
+	/** Entry id of last entry in folded range (closest to leaf) */
+	rangeEndId: string;
+	/** Summary of the folded content */
+	summary: string;
+}
+
+/** Unfold entry - deactivates a previously created fold. */
+export interface UnfoldEntry extends SessionEntryBase {
+	type: "unfold";
+	/** Id of the FoldEntry to deactivate */
+	foldId: string;
+}
+
 /**
  * Custom message entry for extensions to inject messages into LLM context.
  * Use customType to identify your extension's entries.
@@ -143,7 +162,9 @@ export type SessionEntry =
 	| CustomEntry
 	| CustomMessageEntry
 	| LabelEntry
-	| SessionInfoEntry;
+	| SessionInfoEntry
+	| FoldEntry
+	| UnfoldEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -303,7 +324,7 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 /**
  * Build the session context from entries using tree traversal.
  * If leafId is provided, walks from that entry to root.
- * Handles compaction and branch summaries along the path.
+ * Handles compaction, branch summaries, and folds along the path.
  */
 export function buildSessionContext(
 	entries: SessionEntry[],
@@ -361,28 +382,82 @@ export function buildSessionContext(
 		}
 	}
 
-	// Build messages and collect corresponding entries
-	// When there's a compaction, we need to:
-	// 1. Emit summary first (entry = compaction)
-	// 2. Emit kept messages (from firstKeptEntryId up to compaction)
-	// 3. Emit messages after compaction
+	// Build messages with fold handling
+	// Track deactivated folds (those with an unfold entry later in the path)
+	const deactivated = new Set<string>();
 	const messages: AgentMessage[] = [];
+	const entryIds: string[] = []; // Parallel array tracking which entry each message came from
 
+	// First pass: collect deactivated folds
+	for (const entry of path) {
+		if (entry.type === "unfold") {
+			deactivated.add(entry.foldId);
+		}
+	}
+
+	// Helper to check if an entry is within a fold range (unused but kept for potential future use)
+	const _findActiveFoldForEntry = (
+		entryId: string,
+		activeFolds: FoldEntry[],
+		pathIds: string[],
+	): FoldEntry | undefined => {
+		const entryIndex = pathIds.indexOf(entryId);
+		for (const fold of activeFolds) {
+			const startIndex = pathIds.indexOf(fold.rangeStartId);
+			const endIndex = pathIds.indexOf(fold.rangeEndId);
+			if (startIndex !== -1 && endIndex !== -1 && entryIndex >= startIndex && entryIndex <= endIndex) {
+				return fold;
+			}
+		}
+		return undefined;
+	};
+
+	// Collect active folds (those not deactivated)
+	const activeFolds: FoldEntry[] = [];
+	for (const entry of path) {
+		if (entry.type === "fold" && !deactivated.has(entry.id)) {
+			activeFolds.push(entry);
+		}
+	}
+
+	// Build pathIds array for index lookups
+	const pathIds = path.map((e) => e.id);
+
+	// Track which entries have been folded (subsumed by an outer fold)
+	const foldedEntryIds = new Set<string>();
+
+	// Process folds in order, marking folded ranges
+	// Outer folds subsume inner folds
+	for (const fold of activeFolds) {
+		const startIndex = pathIds.indexOf(fold.rangeStartId);
+		const endIndex = pathIds.indexOf(fold.rangeEndId);
+		if (startIndex !== -1 && endIndex !== -1) {
+			for (let i = startIndex; i <= endIndex; i++) {
+				foldedEntryIds.add(pathIds[i]);
+			}
+		}
+	}
+
+	// Build messages array, handling compaction and folds
 	const appendMessage = (entry: SessionEntry) => {
 		if (entry.type === "message") {
 			messages.push(entry.message);
+			entryIds.push(entry.id);
 		} else if (entry.type === "custom_message") {
 			messages.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
 			);
+			entryIds.push(entry.id);
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+			entryIds.push(entry.id);
 		}
 	};
 
 	if (compaction) {
 		// Emit summary first
 		messages.push(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
+		entryIds.push(compaction.id);
 
 		// Find compaction index in path
 		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
@@ -405,9 +480,74 @@ export function buildSessionContext(
 			appendMessage(entry);
 		}
 	} else {
-		// No compaction - emit all messages, handle branch summaries and custom messages
+		// No compaction - emit all messages
 		for (const entry of path) {
 			appendMessage(entry);
+		}
+	}
+
+	// Apply folds: splice out folded ranges and insert fold summaries
+	// Process folds in path order (outermost first)
+	const sortedFolds = [...activeFolds].sort((a, b) => {
+		const aStart = pathIds.indexOf(a.rangeStartId);
+		const bStart = pathIds.indexOf(b.rangeStartId);
+		return aStart - bStart;
+	});
+
+	// Apply folds from outermost to innermost
+	// Track which fold IDs have been applied (to avoid double-applying nested folds)
+	const appliedFoldIds = new Set<string>();
+
+	// Build a map from pathId to current index in entryIds
+	// This needs to be updated after each fold is applied
+	const pathIdToCurrentIndex = new Map<string, number>();
+	for (let i = 0; i < entryIds.length; i++) {
+		pathIdToCurrentIndex.set(entryIds[i], i);
+	}
+
+	for (const fold of sortedFolds) {
+		if (appliedFoldIds.has(fold.id)) continue;
+
+		// Find the indices in pathIds that correspond to this fold's range
+		const startPathIndex = pathIds.indexOf(fold.rangeStartId);
+		const endPathIndex = pathIds.indexOf(fold.rangeEndId);
+
+		if (startPathIndex === -1 || endPathIndex === -1) continue;
+
+		// Find all entryIds that fall within this fold's range
+		const entriesToSplice: string[] = [];
+		for (const entryId of entryIds) {
+			const pathIndex = pathIds.indexOf(entryId);
+			if (pathIndex >= startPathIndex && pathIndex <= endPathIndex) {
+				entriesToSplice.push(entryId);
+			}
+		}
+
+		if (entriesToSplice.length === 0) continue;
+
+		// Find the start and end indices in the current entryIds array
+		const msgStartIndex = entryIds.indexOf(entriesToSplice[0]);
+		const msgEndIndex = entryIds.indexOf(entriesToSplice[entriesToSplice.length - 1]);
+
+		if (msgStartIndex === -1 || msgEndIndex === -1 || msgStartIndex > msgEndIndex) continue;
+
+		// Create fold summary message
+		const foldSummary = createFoldSummaryMessage(fold.summary, fold.id, fold.timestamp);
+
+		// Splice out the folded messages and insert the summary
+		messages.splice(msgStartIndex, msgEndIndex - msgStartIndex + 1, foldSummary);
+		entryIds.splice(msgStartIndex, msgEndIndex - msgStartIndex + 1, fold.id);
+
+		appliedFoldIds.add(fold.id);
+
+		// Mark any nested folds as applied (they're subsumed by this outer fold)
+		for (const nestedFold of activeFolds) {
+			if (nestedFold.id === fold.id) continue;
+			const nestedStart = pathIds.indexOf(nestedFold.rangeStartId);
+			const nestedEnd = pathIds.indexOf(nestedFold.rangeEndId);
+			if (nestedStart >= startPathIndex && nestedEnd <= endPathIndex) {
+				appliedFoldIds.add(nestedFold.id);
+			}
 		}
 	}
 
@@ -946,6 +1086,147 @@ export class SessionManager {
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	// =========================================================================
+	// Fold/Unfold Operations
+	// =========================================================================
+
+	/**
+	 * Get all active folds on the current path.
+	 * An active fold is a FoldEntry with no later UnfoldEntry referencing it.
+	 */
+	getActiveFolds(): FoldEntry[] {
+		const path = this.getBranch();
+		const deactivated = new Set<string>();
+		const activeFolds: FoldEntry[] = [];
+
+		// Walk path in reverse order (leaf to root), tracking which folds are deactivated
+		// This ensures we see unfold entries before the folds they deactivate
+		for (let i = path.length - 1; i >= 0; i--) {
+			const entry = path[i];
+			if (entry.type === "unfold") {
+				deactivated.add(entry.foldId);
+			} else if (entry.type === "fold" && !deactivated.has(entry.id)) {
+				activeFolds.unshift(entry); // Add to front to maintain path order
+			}
+		}
+
+		return activeFolds;
+	}
+
+	/**
+	 * Validate that a proposed fold range is valid.
+	 * @throws Error if validation fails
+	 */
+	private _validateFoldRange(rangeStartId: string, rangeEndId: string): void {
+		// Check that both entries exist
+		const startEntry = this.byId.get(rangeStartId);
+		const endEntry = this.byId.get(rangeEndId);
+
+		if (!startEntry) {
+			throw new Error(`rangeStartId "${rangeStartId}" not found`);
+		}
+		if (!endEntry) {
+			throw new Error(`rangeEndId "${rangeEndId}" not found`);
+		}
+
+		// Check that both entries are on the current path
+		const path = this.getBranch();
+		const pathIds = new Set(path.map((e) => e.id));
+
+		if (!pathIds.has(rangeStartId)) {
+			throw new Error(`rangeStartId "${rangeStartId}" is not on the current path`);
+		}
+		if (!pathIds.has(rangeEndId)) {
+			throw new Error(`rangeEndId "${rangeEndId}" is not on the current path`);
+		}
+
+		// Check that rangeStartId comes before rangeEndId on the path
+		const startIndex = path.findIndex((e) => e.id === rangeStartId);
+		const endIndex = path.findIndex((e) => e.id === rangeEndId);
+
+		if (startIndex > endIndex) {
+			throw new Error(`rangeStartId must come before rangeEndId on the path`);
+		}
+
+		// Check that the range does not include compaction entries
+		for (let i = startIndex; i <= endIndex; i++) {
+			if (path[i].type === "compaction") {
+				throw new Error(`Cannot fold a range that includes a compaction entry`);
+			}
+		}
+
+		// Check nesting constraints with existing active folds
+		const activeFolds = this.getActiveFolds();
+
+		for (const existingFold of activeFolds) {
+			const existingStartIndex = path.findIndex((e) => e.id === existingFold.rangeStartId);
+			const existingEndIndex = path.findIndex((e) => e.id === existingFold.rangeEndId);
+
+			// Check for partial overlap
+			// Valid: disjoint, b inside a, or a inside b
+			const disjoint = endIndex < existingStartIndex || startIndex > existingEndIndex;
+			const bInsideA = startIndex >= existingStartIndex && endIndex <= existingEndIndex;
+			const aInsideB = existingStartIndex >= startIndex && existingEndIndex <= endIndex;
+
+			if (!disjoint && !bInsideA && !aInsideB) {
+				throw new Error(
+					`Fold range [${rangeStartId}, ${rangeEndId}] partially overlaps with existing fold [${existingFold.rangeStartId}, ${existingFold.rangeEndId}]`,
+				);
+			}
+		}
+	}
+
+	/**
+	 * Append a fold entry, marking a range of entries as folded.
+	 * Validates nesting constraints and range constraints before appending.
+	 *
+	 * @param rangeStartId Entry id of first entry in folded range (closest to root)
+	 * @param rangeEndId Entry id of last entry in folded range (closest to leaf)
+	 * @param summary Summary of the folded content
+	 * @returns Entry id of the new FoldEntry
+	 * @throws Error if validation fails
+	 */
+	appendFold(rangeStartId: string, rangeEndId: string, summary: string): string {
+		this._validateFoldRange(rangeStartId, rangeEndId);
+
+		const entry: FoldEntry = {
+			type: "fold",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			rangeStartId,
+			rangeEndId,
+			summary,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/**
+	 * Append an unfold entry, deactivating a previously created fold.
+	 * Post-fold work is preserved - no branching required.
+	 *
+	 * @param foldId Entry id of the FoldEntry to deactivate
+	 * @returns Entry id of the new UnfoldEntry
+	 * @throws Error if fold not found
+	 */
+	appendUnfold(foldId: string): string {
+		const foldEntry = this.byId.get(foldId);
+		if (!foldEntry || foldEntry.type !== "fold") {
+			throw new Error(`Fold entry "${foldId}" not found`);
+		}
+
+		const entry: UnfoldEntry = {
+			type: "unfold",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			foldId,
 		};
 		this._appendEntry(entry);
 		return entry.id;

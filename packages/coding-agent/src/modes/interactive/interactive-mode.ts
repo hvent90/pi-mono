@@ -2485,6 +2485,16 @@ export class InteractiveMode {
 				this.chatContainer.addChild(component);
 				break;
 			}
+			case "foldSummary": {
+				this.chatContainer.addChild(new Spacer(1));
+				const foldComponent = new CompactionSummaryMessageComponent(
+					{ role: "compactionSummary", summary: message.summary, tokensBefore: 0, timestamp: message.timestamp },
+					this.getMarkdownThemeWithSettings(),
+				);
+				foldComponent.setExpanded(this.toolOutputExpanded);
+				this.chatContainer.addChild(foldComponent);
+				break;
+			}
 			case "branchSummary": {
 				this.chatContainer.addChild(new Spacer(1));
 				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());

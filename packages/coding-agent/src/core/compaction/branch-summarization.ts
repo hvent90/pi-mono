@@ -163,6 +163,8 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		case "custom":
 		case "label":
 		case "session_info":
+		case "fold":
+		case "unfold":
 			return undefined;
 	}
 }

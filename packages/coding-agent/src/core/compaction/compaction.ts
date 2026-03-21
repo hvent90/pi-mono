@@ -273,7 +273,8 @@ export function estimateTokens(message: AgentMessage): number {
 			return Math.ceil(chars / 4);
 		}
 		case "branchSummary":
-		case "compactionSummary": {
+		case "compactionSummary":
+		case "foldSummary": {
 			chars = message.summary.length;
 			return Math.ceil(chars / 4);
 		}
@@ -301,6 +302,7 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 					case "custom":
 					case "branchSummary":
 					case "compactionSummary":
+					case "foldSummary":
 					case "user":
 					case "assistant":
 						cutPoints.push(i);
@@ -318,6 +320,8 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 			case "custom_message":
 			case "label":
 			case "session_info":
+			case "fold":
+			case "unfold":
 				break;
 		}
 

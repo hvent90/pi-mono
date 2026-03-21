@@ -140,6 +140,17 @@ class TreeList implements Component {
 		}
 	}
 
+	/** Check if a fold entry has been deactivated by an unfold entry */
+	private _isFoldDeactivated(foldId: string): boolean {
+		for (const flatNode of this.flatNodes) {
+			const entry = flatNode.node.entry;
+			if (entry.type === "unfold" && entry.foldId === foldId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private flattenTree(roots: SessionTreeNode[]): FlatNode[] {
 		const result: FlatNode[] = [];
 		this.toolCallMap.clear();
@@ -303,7 +314,11 @@ class TreeList implements Component {
 				entry.type === "custom" ||
 				entry.type === "model_change" ||
 				entry.type === "thinking_level_change" ||
-				entry.type === "session_info";
+				entry.type === "session_info" ||
+				entry.type === "unfold";
+
+			// Check if this is an inactive fold (has a corresponding unfold entry)
+			const isInactiveFold = entry.type === "fold" && this._isFoldDeactivated(entry.id);
 
 			switch (this.filterMode) {
 				case "user-only":
@@ -312,7 +327,10 @@ class TreeList implements Component {
 					break;
 				case "no-tools":
 					// Default minus tool results
-					passesFilter = !isSettingsEntry && !(entry.type === "message" && entry.message.role === "toolResult");
+					passesFilter =
+						!isSettingsEntry &&
+						!(entry.type === "message" && entry.message.role === "toolResult") &&
+						!isInactiveFold;
 					break;
 				case "labeled-only":
 					// Just labeled entries
@@ -323,8 +341,8 @@ class TreeList implements Component {
 					passesFilter = true;
 					break;
 				default:
-					// Default mode: hide settings/bookkeeping entries
-					passesFilter = !isSettingsEntry;
+					// Default mode: hide settings/bookkeeping entries and inactive folds
+					passesFilter = !isSettingsEntry && !isInactiveFold;
 					break;
 			}
 
@@ -499,7 +517,6 @@ class TreeList implements Component {
 		this.visibleChildrenMap = visibleChildren;
 	}
 
-	/** Get searchable text content from a node */
 	private getSearchableText(node: SessionTreeNode): string {
 		const entry = node.entry;
 		const parts: string[] = [];
@@ -551,6 +568,12 @@ class TreeList implements Component {
 				break;
 			case "label":
 				parts.push("label", entry.label ?? "");
+				break;
+			case "fold":
+				parts.push("fold", entry.summary);
+				break;
+			case "unfold":
+				parts.push("unfold");
 				break;
 		}
 
@@ -764,6 +787,14 @@ class TreeList implements Component {
 				result = entry.name
 					? [theme.fg("dim", "[title: "), theme.fg("dim", entry.name), theme.fg("dim", "]")].join("")
 					: [theme.fg("dim", "[title: "), theme.italic(theme.fg("dim", "empty")), theme.fg("dim", "]")].join("");
+				break;
+			case "fold": {
+				const summary = normalize(entry.summary).slice(0, 50);
+				result = theme.fg("accent", "[fold]: ") + theme.fg("muted", summary);
+				break;
+			}
+			case "unfold":
+				result = theme.fg("dim", "[unfold]");
 				break;
 			default:
 				result = "";
