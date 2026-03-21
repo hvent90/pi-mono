@@ -220,6 +220,33 @@ describe("SessionManager fold/unfold", () => {
 			expect(() => sm.appendUnfold("nonexistent")).toThrow(/not found/);
 		});
 
+		it("throws if fold is already unfolded", () => {
+			const sm = SessionManager.inMemory();
+			const userId = sm.appendMessage({ role: "user", content: "Hello", timestamp: Date.now() });
+			const assistantId = sm.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "Hi!" }],
+				api: "test",
+				provider: "test",
+				model: "test-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+
+			const foldId = sm.appendFold(userId, assistantId, "A greeting exchange");
+			sm.appendUnfold(foldId);
+
+			expect(() => sm.appendUnfold(foldId)).toThrow(/already unfolded/);
+		});
+
 		it("throws if referenced entry is not a fold", () => {
 			const sm = SessionManager.inMemory();
 			const userId = sm.appendMessage({ role: "user", content: "Hello", timestamp: Date.now() });

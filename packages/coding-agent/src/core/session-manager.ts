@@ -395,23 +395,6 @@ export function buildSessionContext(
 		}
 	}
 
-	// Helper to check if an entry is within a fold range (unused but kept for potential future use)
-	const _findActiveFoldForEntry = (
-		entryId: string,
-		activeFolds: FoldEntry[],
-		pathIds: string[],
-	): FoldEntry | undefined => {
-		const entryIndex = pathIds.indexOf(entryId);
-		for (const fold of activeFolds) {
-			const startIndex = pathIds.indexOf(fold.rangeStartId);
-			const endIndex = pathIds.indexOf(fold.rangeEndId);
-			if (startIndex !== -1 && endIndex !== -1 && entryIndex >= startIndex && entryIndex <= endIndex) {
-				return fold;
-			}
-		}
-		return undefined;
-	};
-
 	// Collect active folds (those not deactivated)
 	const activeFolds: FoldEntry[] = [];
 	for (const entry of path) {
@@ -422,21 +405,6 @@ export function buildSessionContext(
 
 	// Build pathIds array for index lookups
 	const pathIds = path.map((e) => e.id);
-
-	// Track which entries have been folded (subsumed by an outer fold)
-	const foldedEntryIds = new Set<string>();
-
-	// Process folds in order, marking folded ranges
-	// Outer folds subsume inner folds
-	for (const fold of activeFolds) {
-		const startIndex = pathIds.indexOf(fold.rangeStartId);
-		const endIndex = pathIds.indexOf(fold.rangeEndId);
-		if (startIndex !== -1 && endIndex !== -1) {
-			for (let i = startIndex; i <= endIndex; i++) {
-				foldedEntryIds.add(pathIds[i]);
-			}
-		}
-	}
 
 	// Build messages array, handling compaction and folds
 	const appendMessage = (entry: SessionEntry) => {
@@ -1219,6 +1187,14 @@ export class SessionManager {
 		const foldEntry = this.byId.get(foldId);
 		if (!foldEntry || foldEntry.type !== "fold") {
 			throw new Error(`Fold entry "${foldId}" not found`);
+		}
+
+		// Check if already unfolded on current path
+		const path = this.getBranch();
+		for (const entry of path) {
+			if (entry.type === "unfold" && entry.foldId === foldId) {
+				throw new Error(`Fold "${foldId}" is already unfolded`);
+			}
 		}
 
 		const entry: UnfoldEntry = {

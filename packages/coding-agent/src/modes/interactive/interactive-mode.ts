@@ -81,6 +81,7 @@ import { DynamicBorder } from "./components/dynamic-border.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
+import { FoldSummaryMessageComponent } from "./components/fold-summary-message.js";
 import { FooterComponent } from "./components/footer.js";
 import { keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
@@ -2487,10 +2488,7 @@ export class InteractiveMode {
 			}
 			case "foldSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const foldComponent = new CompactionSummaryMessageComponent(
-					{ role: "compactionSummary", summary: message.summary, tokensBefore: 0, timestamp: message.timestamp },
-					this.getMarkdownThemeWithSettings(),
-				);
+				const foldComponent = new FoldSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				foldComponent.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(foldComponent);
 				break;
