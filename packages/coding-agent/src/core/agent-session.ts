@@ -36,6 +36,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -238,6 +239,7 @@ export class AgentSession {
 
 	// Fold state — tracks leaf at agent_start for auto-folding peek results
 	private _agentStartLeafId: string | null = null;
+	private _foldOccurredDuringTurn = false;
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
@@ -339,6 +341,11 @@ export class AgentSession {
 		});
 
 		this.agent.setAfterToolCall(async ({ toolCall, args, result, isError }) => {
+			// Track fold/unfold calls for post-turn state rebuild
+			if ((toolCall.name === "fold" || toolCall.name === "unfold") && !isError) {
+				this._foldOccurredDuringTurn = true;
+			}
+
 			const runner = this._extensionRunner;
 			if (!runner?.hasHandlers("tool_result")) {
 				return undefined;
@@ -519,6 +526,15 @@ export class AgentSession {
 			this._resolveRetry();
 			await this._checkCompaction(msg);
 			this._autoFoldPeekResults();
+
+			// Rebuild state after fold/unfold so context meter reflects folded state
+			if (this._foldOccurredDuringTurn) {
+				this._foldOccurredDuringTurn = false;
+				const sessionContext = this.sessionManager.buildSessionContext();
+				this.agent.replaceMessages(sessionContext.messages);
+				// Re-notify UI so footer re-renders with updated context usage
+				this._emit(event);
+			}
 		}
 	}
 
@@ -3108,11 +3124,38 @@ export class AgentSession {
 			}
 		}
 
-		const estimate = estimateContextTokens(this.messages);
-		const percent = (estimate.tokens / contextWindow) * 100;
+		// After a fold/unfold, the last assistant's usage reflects pre-fold context.
+		// Check if there's a fold or unfold entry after the last assistant message.
+		// If so, the cached usage is stale — estimate all tokens from scratch.
+		let hasFoldAfterLastAssistant = false;
+		let foundAssistant = false;
+		for (let i = branchEntries.length - 1; i >= 0; i--) {
+			const entry = branchEntries[i];
+			if (!foundAssistant && entry.type === "message" && entry.message.role === "assistant") {
+				foundAssistant = true;
+				continue;
+			}
+			if (!foundAssistant && (entry.type === "fold" || entry.type === "unfold")) {
+				hasFoldAfterLastAssistant = true;
+				break;
+			}
+		}
+
+		let tokens: number;
+		if (hasFoldAfterLastAssistant) {
+			// Usage from last assistant is stale — estimate all messages from scratch
+			tokens = 0;
+			for (const m of this.messages) {
+				tokens += estimateTokens(m);
+			}
+		} else {
+			const estimate = estimateContextTokens(this.messages);
+			tokens = estimate.tokens;
+		}
+		const percent = (tokens / contextWindow) * 100;
 
 		return {
-			tokens: estimate.tokens,
+			tokens,
 			contextWindow,
 			percent,
 		};
