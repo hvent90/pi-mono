@@ -43,6 +43,7 @@
 		"@mariozechner/pi-agent-core": "^0.61.1",
 		"@mariozechner/pi-ai": "^0.61.1",
 		"@mariozechner/pi-tui": "^0.61.1",
+		"@runwayml/sdk": "^3.16.0",
 		"@silvia-odwyer/photon-node": "^0.3.4",
 		"chalk": "^5.5.0",
 		"cli-highlight": "^2.1.11",

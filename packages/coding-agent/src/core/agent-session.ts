@@ -240,6 +240,9 @@ export class AgentSession {
 	// Fold state — tracks leaf at agent_start for auto-folding peek results
 	private _agentStartLeafId: string | null = null;
 	private _foldOccurredDuringTurn = false;
+	// Set when a fold/unfold makes the last assistant's cached usage stale.
+	// Cleared when a new assistant response provides fresh usage.
+	private _foldDirtyUsage = false;
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
@@ -344,6 +347,7 @@ export class AgentSession {
 			// Track fold/unfold calls for post-turn state rebuild
 			if ((toolCall.name === "fold" || toolCall.name === "unfold") && !isError) {
 				this._foldOccurredDuringTurn = true;
+				this._foldDirtyUsage = true;
 			}
 
 			const runner = this._extensionRunner;
@@ -499,6 +503,11 @@ export class AgentSession {
 					this._overflowRecoveryAttempted = false;
 				}
 
+				// Fresh usage from the provider makes fold-dirty estimation unnecessary
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					this._foldDirtyUsage = false;
+				}
+
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
@@ -532,7 +541,8 @@ export class AgentSession {
 				this._foldOccurredDuringTurn = false;
 				const sessionContext = this.sessionManager.buildSessionContext();
 				this.agent.replaceMessages(sessionContext.messages);
-				// Re-notify UI so footer re-renders with updated context usage
+				// Re-notify extensions and UI so both reflect post-fold context usage
+				await this._emitExtensionEvent(event);
 				this._emit(event);
 			}
 		}
@@ -823,6 +833,11 @@ export class AgentSession {
 		// Rebuild base system prompt with new tool set
 		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
 		this.agent.setSystemPrompt(this._baseSystemPrompt);
+	}
+
+	/** Whether a fold or unfold occurred during the current agent turn. */
+	get hasPendingFoldRebuild(): boolean {
+		return this._foldOccurredDuringTurn;
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -3124,25 +3139,30 @@ export class AgentSession {
 			}
 		}
 
-		// After a fold/unfold, the last assistant's usage reflects pre-fold context.
-		// Check if there's a fold or unfold entry after the last assistant message.
-		// If so, the cached usage is stale — estimate all tokens from scratch.
-		let hasFoldAfterLastAssistant = false;
-		let foundAssistant = false;
-		for (let i = branchEntries.length - 1; i >= 0; i--) {
-			const entry = branchEntries[i];
-			if (!foundAssistant && entry.type === "message" && entry.message.role === "assistant") {
-				foundAssistant = true;
-				continue;
-			}
-			if (!foundAssistant && (entry.type === "fold" || entry.type === "unfold")) {
-				hasFoldAfterLastAssistant = true;
-				break;
+		// After a fold/unfold, the last assistant's cached usage reflects pre-fold context.
+		// _foldDirtyUsage is set when a fold/unfold tool call succeeds and cleared when
+		// a new assistant response provides fresh usage. This handles the common case where
+		// the agent calls fold mid-turn — the fold entry sits before the final assistant
+		// message in the entry list, so a backwards walk would miss it.
+		// Also check for fold entries after the last assistant (covers manual/post-turn folds).
+		let foldMadeCachedUsageStale = this._foldDirtyUsage;
+		if (!foldMadeCachedUsageStale) {
+			let foundAssistant = false;
+			for (let i = branchEntries.length - 1; i >= 0; i--) {
+				const entry = branchEntries[i];
+				if (!foundAssistant && entry.type === "message" && entry.message.role === "assistant") {
+					foundAssistant = true;
+					continue;
+				}
+				if (!foundAssistant && (entry.type === "fold" || entry.type === "unfold")) {
+					foldMadeCachedUsageStale = true;
+					break;
+				}
 			}
 		}
 
 		let tokens: number;
-		if (hasFoldAfterLastAssistant) {
+		if (foldMadeCachedUsageStale) {
 			// Usage from last assistant is stale — estimate all messages from scratch
 			tokens = 0;
 			for (const m of this.messages) {

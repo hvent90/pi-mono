@@ -63,6 +63,7 @@ class TreeList implements Component {
 	private visibleChildrenMap: Map<string | null, string[]> = new Map();
 	private lastSelectedId: string | null = null;
 	private foldedNodes: Set<string> = new Set();
+	private insideFoldIds: Set<string> = new Set();
 
 	public onSelect?: (entryId: string) => void;
 	public onCancel?: () => void;
@@ -149,6 +150,27 @@ class TreeList implements Component {
 			}
 		}
 		return false;
+	}
+
+	/** Compute the set of entry IDs that fall inside an active fold's range. */
+	private _computeInsideFoldIds(): Set<string> {
+		const result = new Set<string>();
+		const orderedIds = this.flatNodes.map((n) => n.node.entry.id);
+
+		for (const flatNode of this.flatNodes) {
+			const entry = flatNode.node.entry;
+			if (entry.type === "fold" && !this._isFoldDeactivated(entry.id)) {
+				const startIdx = orderedIds.indexOf(entry.rangeStartId);
+				const endIdx = orderedIds.indexOf(entry.rangeEndId);
+				if (startIdx !== -1 && endIdx !== -1 && startIdx <= endIdx) {
+					for (let i = startIdx; i <= endIdx; i++) {
+						result.add(orderedIds[i]);
+					}
+				}
+			}
+		}
+
+		return result;
 	}
 
 	private flattenTree(roots: SessionTreeNode[]): FlatNode[] {
@@ -368,6 +390,9 @@ class TreeList implements Component {
 			}
 			this.filteredNodes = this.filteredNodes.filter((flatNode) => !skipSet.has(flatNode.node.entry.id));
 		}
+
+		// Compute which entries are inside active fold ranges (for visual dimming)
+		this.insideFoldIds = this._computeInsideFoldIds();
 
 		// Recalculate visual structure (indent, connectors, gutters) based on visible tree
 		this.recalculateVisualStructure();
@@ -690,7 +715,10 @@ class TreeList implements Component {
 			const pathMarker = isOnActivePath ? theme.fg("accent", "• ") : "";
 
 			const label = flatNode.node.label ? theme.fg("warning", `[${flatNode.node.label}] `) : "";
-			const content = this.getEntryDisplayText(flatNode.node, isSelected);
+			const isInsideFold = this.insideFoldIds.has(entry.id);
+			const content = isInsideFold
+				? theme.strikethrough(this.getEntryDisplayText(flatNode.node, isSelected))
+				: this.getEntryDisplayText(flatNode.node, isSelected);
 
 			let line = cursor + theme.fg("dim", prefix) + foldMarker + pathMarker + label + content;
 			if (isSelected) {

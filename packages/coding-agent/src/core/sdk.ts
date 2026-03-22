@@ -4,6 +4,7 @@ import type { Message, Model } from "@mariozechner/pi-ai";
 import { getAgentDir, getDocsPath } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
+import { estimateTokens } from "./compaction/index.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, ToolDefinition } from "./extensions/index.js";
 import { convertToLlm } from "./messages.js";
@@ -305,8 +306,45 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionId: sessionManager.getSessionId(),
 		transformContext: async (messages) => {
 			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
+			let result = runner ? await runner.emitContext(messages) : messages;
+
+			// Always inject an ephemeral user message with context usage metadata
+			// so the model sees accurate numbers at the hot end of context,
+			// especially during long multi-step agent trajectories.
+			const m = sessionRef?.model;
+			const contextWindow = m?.contextWindow ?? 0;
+			if (contextWindow > 0) {
+				// When a fold/unfold occurred this turn, agent state messages are stale —
+				// rebuild from session manager for accurate post-fold numbers.
+				let tokens: number;
+				if (sessionRef?.hasPendingFoldRebuild) {
+					const { messages: freshMessages } = sessionManager.buildSessionContext();
+					tokens = 0;
+					for (const msg of freshMessages) {
+						tokens += estimateTokens(msg);
+					}
+				} else {
+					tokens = 0;
+					for (const msg of result) {
+						tokens += estimateTokens(msg);
+					}
+				}
+
+				const pct = ((tokens / contextWindow) * 100).toFixed(1);
+				const tokensK = Math.round(tokens / 1000);
+				const windowK = Math.round(contextWindow / 1000);
+
+				result = [
+					...result,
+					{
+						role: "user" as const,
+						content: `<system>Context: ~${tokensK}k / ${windowK}k tokens (${pct}%)</system>`,
+						timestamp: Date.now(),
+					},
+				];
+			}
+
+			return result;
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
@@ -356,6 +394,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const foldTools = createFoldTools(sessionManager);
 
+	// Deferred ref for transformContext — set after session construction,
+	// but only accessed during agent turns when the session is already live.
+	let sessionRef: AgentSession | undefined;
+
 	const session = new AgentSession({
 		agent,
 		sessionManager,
@@ -368,6 +410,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		initialActiveToolNames,
 		extensionRunnerRef,
 	});
+	sessionRef = session;
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {
