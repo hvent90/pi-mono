@@ -236,6 +236,9 @@ export class AgentSession {
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
 
+	// Fold state — tracks leaf at agent_start for auto-folding peek results
+	private _agentStartLeafId: string | null = null;
+
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
@@ -425,6 +428,11 @@ export class AgentSession {
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
+		// Track leaf ID at agent start for auto-folding peek results
+		if (event.type === "agent_start") {
+			this._agentStartLeafId = this.sessionManager.getLeafId();
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -456,19 +464,22 @@ export class AgentSession {
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
+				const entryId = this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
 					event.message.content,
 					event.message.display,
 					event.message.details,
 				);
+				(event.message as any)._entryId = entryId;
 			} else if (
 				event.message.role === "user" ||
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const entryId = this.sessionManager.appendMessage(event.message);
+				// Annotate so convertToLlm can prepend [id:...] tags on subsequent API calls
+				(event.message as any)._entryId = entryId;
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -507,7 +518,69 @@ export class AgentSession {
 
 			this._resolveRetry();
 			await this._checkCompaction(msg);
+			this._autoFoldPeekResults();
 		}
+	}
+
+	/**
+	 * Auto-fold peek tool results appended during the agent turn.
+	 * Peek is read-only but its tool result inflates context; folding it
+	 * keeps the peeked content from persisting across turns.
+	 */
+	private _autoFoldPeekResults(): void {
+		if (!this._agentStartLeafId) return;
+
+		const path = this.sessionManager.getBranch();
+		const startIdx = path.findIndex((e) => e.id === this._agentStartLeafId);
+		if (startIdx === -1) return;
+
+		// Entries appended during this agent turn
+		const newEntries = path.slice(startIdx + 1);
+
+		// Find peek tool calls in assistant messages
+		const peekToolUseIds: Map<string, string> = new Map(); // toolUseId → foldId argument
+		for (const entry of newEntries) {
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const content = entry.message.content;
+				if (Array.isArray(content)) {
+					for (const block of content) {
+						if (block.type === "toolCall" && block.name === "peek") {
+							const foldId = (block.arguments as any)?.foldId;
+							if (foldId) {
+								peekToolUseIds.set(block.id, foldId);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (peekToolUseIds.size === 0) return;
+
+		// Find tool result entries that correspond to peek calls
+		let folded = false;
+		for (const entry of newEntries) {
+			if (entry.type === "message" && entry.message.role === "toolResult") {
+				const toolUseId = (entry.message as any).toolUseId;
+				const foldId = peekToolUseIds.get(toolUseId);
+				if (foldId) {
+					try {
+						this.sessionManager.appendFold(entry.id, entry.id, `peeked at fold ${foldId}`);
+						folded = true;
+					} catch {
+						// Fold validation failed — skip silently
+					}
+				}
+			}
+		}
+
+		if (folded) {
+			// Rebuild agent state with folded peek results
+			const sessionContext = this.sessionManager.buildSessionContext();
+			this.agent.replaceMessages(sessionContext.messages);
+		}
+
+		this._agentStartLeafId = null;
 	}
 
 	/** Resolve the pending retry promise */
@@ -2527,8 +2600,9 @@ export class AgentSession {
 			// Add to agent state immediately
 			this.agent.appendMessage(bashMessage);
 
-			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
+			// Save to session and annotate with entry ID
+			const entryId = this.sessionManager.appendMessage(bashMessage);
+			(bashMessage as any)._entryId = entryId;
 		}
 	}
 
@@ -2560,8 +2634,9 @@ export class AgentSession {
 			// Add to agent state
 			this.agent.appendMessage(bashMessage);
 
-			// Save to session
-			this.sessionManager.appendMessage(bashMessage);
+			// Save to session and annotate with entry ID
+			const entryId = this.sessionManager.appendMessage(bashMessage);
+			(bashMessage as any)._entryId = entryId;
 		}
 
 		this._pendingBashMessages = [];

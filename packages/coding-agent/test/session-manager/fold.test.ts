@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { convertToLlm } from "../../src/core/messages.js";
 import { SessionManager, type SessionMessageEntry } from "../../src/core/session-manager.js";
 
 function _msg(id: string, parentId: string | null, role: "user" | "assistant", text: string): SessionMessageEntry {
@@ -406,6 +407,95 @@ describe("SessionManager fold/unfold", () => {
 			for (let i = 0; i < 5; i++) {
 				expect(context.messages[i].role).toBe("user");
 			}
+		});
+	});
+
+	describe("entry ID annotation", () => {
+		it("annotates messages with _entryId", () => {
+			const sm = SessionManager.inMemory();
+			const entries: string[] = [];
+			for (let i = 0; i < 3; i++) {
+				entries.push(sm.appendMessage({ role: "user", content: `Message ${i}`, timestamp: Date.now() }));
+			}
+
+			const context = sm.buildSessionContext();
+
+			expect(context.messages.length).toBe(3);
+			for (let i = 0; i < 3; i++) {
+				expect((context.messages[i] as any)._entryId).toBe(entries[i]);
+			}
+		});
+
+		it("annotates fold summaries with the fold entry ID", () => {
+			const sm = SessionManager.inMemory();
+			const entries: string[] = [];
+			for (let i = 0; i < 5; i++) {
+				entries.push(sm.appendMessage({ role: "user", content: `Message ${i}`, timestamp: Date.now() }));
+			}
+
+			const foldId = sm.appendFold(entries[1], entries[3], "Folded messages");
+
+			const context = sm.buildSessionContext();
+
+			// Fold summary should have the fold entry's ID
+			const foldSummary = context.messages.find((m) => m.role === "foldSummary");
+			expect(foldSummary).toBeDefined();
+			expect((foldSummary as any)._entryId).toBe(foldId);
+		});
+	});
+
+	describe("convertToLlm with entry IDs", () => {
+		it("prepends entry ID to user messages", () => {
+			const sm = SessionManager.inMemory();
+			const entryId = sm.appendMessage({ role: "user", content: "Hello", timestamp: Date.now() });
+
+			const context = sm.buildSessionContext();
+			const llmMessages = convertToLlm(context.messages);
+
+			expect(llmMessages.length).toBe(1);
+			const content = llmMessages[0].content;
+			expect(typeof content).toBe("string");
+			expect(content).toBe(`[id:${entryId}] Hello`);
+		});
+
+		it("prepends entry ID to assistant messages", () => {
+			const sm = SessionManager.inMemory();
+			sm.appendMessage({ role: "user", content: "Hello", timestamp: Date.now() });
+			const assistantId = sm.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "Hi there!" }],
+				api: "test",
+				provider: "test",
+				model: "test-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			});
+
+			const context = sm.buildSessionContext();
+			const llmMessages = convertToLlm(context.messages);
+
+			// Assistant message should have prepended ID
+			const assistantMsg = llmMessages.find((m) => m.role === "assistant");
+			expect(assistantMsg).toBeDefined();
+			const firstBlock = (assistantMsg!.content as any[])[0];
+			expect(firstBlock.text).toMatch(new RegExp(`^\\[id:${assistantId}\\] `));
+		});
+
+		it("does not prepend ID to messages without _entryId", () => {
+			// Messages without _entryId (e.g., current-turn messages) should pass through unchanged
+			const messages = [{ role: "user" as const, content: "Hello", timestamp: Date.now() }];
+			const llmMessages = convertToLlm(messages);
+
+			expect(llmMessages.length).toBe(1);
+			expect(llmMessages[0].content).toBe("Hello");
 		});
 	});
 });

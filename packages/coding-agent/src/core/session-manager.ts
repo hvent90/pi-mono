@@ -466,13 +466,6 @@ export function buildSessionContext(
 	// Track which fold IDs have been applied (to avoid double-applying nested folds)
 	const appliedFoldIds = new Set<string>();
 
-	// Build a map from pathId to current index in entryIds
-	// This needs to be updated after each fold is applied
-	const pathIdToCurrentIndex = new Map<string, number>();
-	for (let i = 0; i < entryIds.length; i++) {
-		pathIdToCurrentIndex.set(entryIds[i], i);
-	}
-
 	for (const fold of sortedFolds) {
 		if (appliedFoldIds.has(fold.id)) continue;
 
@@ -517,6 +510,11 @@ export function buildSessionContext(
 				appliedFoldIds.add(nestedFold.id);
 			}
 		}
+	}
+
+	// Annotate messages with entry IDs for convertToLlm to prepend
+	for (let i = 0; i < messages.length; i++) {
+		(messages[i] as any)._entryId = entryIds[i];
 	}
 
 	return { messages, thinkingLevel, model };

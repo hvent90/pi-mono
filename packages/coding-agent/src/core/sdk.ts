@@ -14,6 +14,7 @@ import { DefaultResourceLoader } from "./resource-loader.js";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { time } from "./timings.js";
+import { createFoldTools } from "./tools/fold.js";
 import {
 	allTools,
 	bashTool,
@@ -353,6 +354,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
+	const foldTools = createFoldTools(sessionManager);
+
 	const session = new AgentSession({
 		agent,
 		sessionManager,
@@ -360,7 +363,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		cwd,
 		scopedModels: options.scopedModels,
 		resourceLoader,
-		customTools: options.customTools,
+		customTools: [...foldTools, ...(options.customTools ?? [])],
 		modelRegistry,
 		initialActiveToolNames,
 		extensionRunnerRef,

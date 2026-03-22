@@ -162,6 +162,43 @@ export function createCustomMessage(
 }
 
 /**
+ * Prepend an entry ID tag to a converted LLM message.
+ * Entry IDs are set on AgentMessages by buildSessionContext() as `_entryId`.
+ */
+function prependEntryId(msg: Message, entryId: string): Message {
+	const tag = `[id:${entryId}] `;
+
+	if (msg.role === "user") {
+		const content = msg.content;
+		if (typeof content === "string") {
+			return { ...msg, content: tag + content };
+		}
+		if (Array.isArray(content) && content.length > 0 && content[0].type === "text") {
+			return { ...msg, content: [{ ...content[0], text: tag + content[0].text }, ...content.slice(1)] };
+		}
+		return msg;
+	}
+
+	if (msg.role === "assistant") {
+		const content = msg.content;
+		if (content.length > 0 && content[0].type === "text") {
+			return { ...msg, content: [{ ...content[0], text: tag + content[0].text }, ...content.slice(1)] };
+		}
+		return msg;
+	}
+
+	if (msg.role === "toolResult") {
+		const content = msg.content;
+		if (content.length > 0 && content[0].type === "text") {
+			return { ...msg, content: [{ ...content[0], text: tag + content[0].text }, ...content.slice(1)] };
+		}
+		return msg;
+	}
+
+	return msg;
+}
+
+/**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
  * This is used by:
@@ -172,54 +209,68 @@ export function createCustomMessage(
 export function convertToLlm(messages: AgentMessage[]): Message[] {
 	return messages
 		.map((m): Message | undefined => {
+			const entryId = (m as any)._entryId as string | undefined;
+			let converted: Message | undefined;
+
 			switch (m.role) {
 				case "bashExecution":
 					// Skip messages excluded from context (!! prefix)
 					if (m.excludeFromContext) {
 						return undefined;
 					}
-					return {
+					converted = {
 						role: "user",
 						content: [{ type: "text", text: bashExecutionToText(m) }],
 						timestamp: m.timestamp,
 					};
+					break;
 				case "custom": {
 					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
-					return {
+					converted = {
 						role: "user",
 						content,
 						timestamp: m.timestamp,
 					};
+					break;
 				}
 				case "branchSummary":
-					return {
+					converted = {
 						role: "user",
 						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
 						timestamp: m.timestamp,
 					};
+					break;
 				case "compactionSummary":
-					return {
+					converted = {
 						role: "user",
 						content: [
 							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
 						],
 						timestamp: m.timestamp,
 					};
+					break;
 				case "foldSummary":
-					return {
+					converted = {
 						role: "user",
 						content: [{ type: "text" as const, text: FOLD_SUMMARY_PREFIX + m.summary + FOLD_SUMMARY_SUFFIX }],
 						timestamp: m.timestamp,
 					};
+					break;
 				case "user":
 				case "assistant":
 				case "toolResult":
-					return m;
+					converted = m;
+					break;
 				default:
 					// biome-ignore lint/correctness/noSwitchDeclarations: fine
 					const _exhaustiveCheck: never = m;
 					return undefined;
 			}
+
+			if (converted && entryId) {
+				return prependEntryId(converted, entryId);
+			}
+			return converted;
 		})
 		.filter((m) => m !== undefined);
 }
